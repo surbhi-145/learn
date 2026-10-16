@@ -1,0 +1,1 @@
+{"name":"fruits","columns":[{"name":"name","type":"string","size":255,"offset":0},{"name":"cost","type":"int","size":4,"offset":255}],"primary_key":"name","row_size":259,"num_rows":1}

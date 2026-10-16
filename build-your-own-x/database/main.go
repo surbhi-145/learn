@@ -4,8 +4,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +17,7 @@ import (
 const (
 	PAGE_SIZE       = 4096
 	TABLE_MAX_PAGES = 100
+	DB_DIR          = "./db"
 )
 
 type ParseError struct {
@@ -25,23 +29,164 @@ func (e *ParseError) Error() string {
 }
 
 type Column struct {
-	Name   string
-	Type   string
-	Size   uint32
-	Offset uint32
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Size   uint32 `json:"size"`
+	Offset uint32 `json:"offset"`
+}
+
+type Pager struct {
+	File  *os.File
+	Pages [TABLE_MAX_PAGES][]byte
 }
 
 type Table struct {
-	Name       string
-	Columns    []Column
-	PrimaryKey string
-	RowSize    uint32
-	NumRows    uint32
-	Pages      [TABLE_MAX_PAGES][]byte
+	Name       string   `json:"name"`
+	Columns    []Column `json:"columns"`
+	PrimaryKey string   `json:"primary_key"`
+	RowSize    uint32   `json:"row_size"`
+	NumRows    uint32   `json:"num_rows"`
+	Pager      *Pager   `json:"pager"`
 }
 
 type Database struct {
 	Tables map[string]*Table
+}
+
+func NewPager(tableName string) (*Pager, uint32, error) {
+	filename := filepath.Join(DB_DIR, tableName+".db")
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return nil, 0, err
+	}
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	fileSize := fileInfo.Size()
+	pager := &Pager{
+		File:  file,
+		Pages: [TABLE_MAX_PAGES][]byte{},
+	}
+	return pager, uint32(fileSize), nil
+}
+
+func (p *Pager) FlushPage(pageNum uint32, size uint32) error {
+	if p.Pages[pageNum] == nil {
+		return fmt.Errorf("page %d is not loaded in memory", pageNum)
+	}
+	_, err := p.File.WriteAt(p.Pages[pageNum][:size], int64(pageNum*PAGE_SIZE))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func flushTable(table *Table) error {
+	// store the table metadata (columns, primary key, etc.) in a separate file or in the first page of the table file
+	// We can store these into JSON format.
+	file, err := os.OpenFile(filepath.Join(DB_DIR, table.Name+".meta"), os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Serialize the table metadata to JSON
+	metadata := fmt.Sprintf(`{"name":"%s","columns":[`, table.Name)
+	for i, column := range table.Columns {
+		metadata += fmt.Sprintf(`{"name":"%s","type":"%s","size":%d,"offset":%d}`, column.Name, column.Type, column.Size, column.Offset)
+		if i < len(table.Columns)-1 {
+			metadata += ","
+		}
+	}
+	metadata += fmt.Sprintf(`],"primary_key":"%s","row_size":%d,"num_rows":%d}`, table.PrimaryKey, table.RowSize, table.NumRows)
+
+	_, err = file.WriteString(metadata)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func InitializeDatabase() *Database {
+	db := &Database{
+		Tables: make(map[string]*Table),
+	}
+
+	// load all saved tables from the database directory
+	files, err := os.ReadDir(DB_DIR)
+	if err != nil {
+		fmt.Println("Error reading database directory:", err)
+		return db
+	}
+
+	for _, file := range files {
+		if !file.IsDir() && strings.HasSuffix(file.Name(), ".db") {
+			tableName := strings.TrimSuffix(file.Name(), ".db")
+			pager, fileSize, err := NewPager(tableName)
+			if err != nil {
+				fmt.Println("Error loading table", tableName, ":", err)
+				continue
+			}
+			tableMetadataFileName := filepath.Join(DB_DIR, tableName+".meta")
+			tableMetadataFile, err := os.Open(tableMetadataFileName)
+			defer tableMetadataFile.Close()
+			if err != nil {
+				fmt.Println("Error opening metadata file for table", tableName, ":", err)
+				continue
+			}
+
+			decoder := json.NewDecoder(tableMetadataFile)
+			var tableMetadata Table
+			err = decoder.Decode(&tableMetadata)
+			if err != nil {
+				fmt.Println("Error decoding metadata for table", tableName, ":", err)
+				continue
+			}
+
+			numRows := 0
+			if tableMetadata.RowSize > 0 {
+				numRows = int(fileSize / tableMetadata.RowSize)
+			}
+			table := &Table{
+				Name:       tableName,
+				Columns:    tableMetadata.Columns,    // Columns will be loaded from metadata
+				PrimaryKey: tableMetadata.PrimaryKey, // Primary key will be loaded from metadata
+				RowSize:    tableMetadata.RowSize,    // Row size will be loaded from metadata
+				NumRows:    uint32(numRows),
+				Pager:      pager,
+			}
+			db.Tables[tableName] = table
+		}
+	}
+
+	return db
+}
+
+func CloseDatabase(db *Database) error {
+	for _, table := range db.Tables {
+		pager := table.Pager
+		if pager != nil {
+			for pageNum, page := range pager.Pages {
+				if page != nil {
+					err := pager.FlushPage(uint32(pageNum), table.RowSize)
+					if err != nil {
+						return err
+					}
+				}
+			}
+			err := pager.File.Close()
+			if err != nil {
+				return err
+			}
+		}
+		err := flushTable(table)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func printTable(table Table) {
@@ -112,16 +257,23 @@ func parseCreateStatement(db *Database, input string) *ParseError {
 		}
 		columns = append(columns, column)
 	}
-	err := validatePrimaryKey(columns, primaryKey)
-	if err != nil {
-		return err
+	errs := validatePrimaryKey(columns, primaryKey)
+	if errs != nil {
+		return errs
 	}
 	offset, updatedColumns := calculateColumnLayout(columns)
+	pager, fileSize, err := NewPager(tableName)
+	numRows := fileSize / offset
+	if err != nil {
+		return &ParseError{Message: "Failed to create pager for table '" + tableName + "': " + err.Error()}
+	}
 	table := Table{
 		Name:       tableName,
 		Columns:    updatedColumns,
 		PrimaryKey: primaryKey,
 		RowSize:    offset,
+		Pager:      pager,
+		NumRows:    uint32(numRows),
 	}
 	printTable(table)
 	if db.Tables[tableName] != nil {
@@ -191,11 +343,18 @@ func rowSlot(table *Table, rowNum uint32) ([]byte, uint32) {
 	byteOffset := rowOffset * table.RowSize
 
 	// Allocate page memory only when accessed (lazy allocation)
-	if table.Pages[pageNum] == nil {
-		table.Pages[pageNum] = make([]byte, PAGE_SIZE)
+	// Cache miss
+	if table.Pager.Pages[pageNum] == nil {
+		table.Pager.Pages[pageNum] = make([]byte, PAGE_SIZE)
+
+		_, err := table.Pager.File.ReadAt(table.Pager.Pages[pageNum], int64(pageNum*PAGE_SIZE))
+		// read from disk into memory, if the page is not already in memory
+		if err != nil && err != io.EOF {
+			fmt.Println("Error reading page from file:", err)
+		}
 	}
 
-	return table.Pages[pageNum], byteOffset
+	return table.Pager.Pages[pageNum], byteOffset
 }
 
 func parseInsertStatement(db *Database, input string) *ParseError {
@@ -274,9 +433,13 @@ func parseSelectStatement(db *Database, input string) *ParseError {
 	return nil
 }
 
-func metaCommand(input string) {
+func metaCommand(db *Database, input string) {
 	switch input {
 	case ".exit":
+		err := CloseDatabase(db)
+		if err != nil {
+			fmt.Println("Error closing database:", err)
+		}
 		os.Exit(0)
 	default:
 		fmt.Println("Unrecognized command '" + input + "'.")
@@ -305,17 +468,15 @@ func executeStatement(db *Database, input string) {
 }
 
 func main() {
-	db := Database{
-		Tables: make(map[string]*Table),
-	}
+	db := InitializeDatabase()
 	fmt.Print("> ")
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		input := scanner.Text()
 		if strings.HasPrefix(input, ".") {
-			metaCommand(input)
+			metaCommand(db, input)
 		} else {
-			executeStatement(&db, input)
+			executeStatement(db, input)
 		}
 		fmt.Print("> ")
 	}
