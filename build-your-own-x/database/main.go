@@ -1,5 +1,3 @@
-// this code is part of https://cstack.github.io/db_tutorial/
-
 package main
 
 import (
@@ -18,6 +16,33 @@ const (
 	PAGE_SIZE       = 4096
 	TABLE_MAX_PAGES = 100
 	DB_DIR          = "./db"
+)
+
+const (
+	NODE_INTERNAL uint8 = 0
+	NODE_LEAF     uint8 = 1
+)
+
+// Common Header Layout Constants (in bytes)
+const (
+	NODE_TYPE_OFFSET         = 0 // 1 byte
+	NODE_IS_ROOT_OFFSET      = 1 // 1 byte
+	POINTER_TO_PARENT_OFFSET = 2 // 4 bytes (uint32)
+	NUM_CELLS_OFFSET         = 6 // 4 bytes (uint32)
+	COMMON_NODE_HEADER_SIZE  = 10
+)
+
+// Leaf Node Constants
+const (
+	LEAF_NODE_KEY_SIZE    = 4 // uint32 primary key
+	LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE
+)
+
+// Internal Node Constants
+const (
+	INTERNAL_NODE_CHILD_SIZE  = 4 // uint32 page number
+	INTERNAL_NODE_KEY_SIZE    = 4 // uint32 key
+	INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE
 )
 
 type ParseError struct {
@@ -41,247 +66,321 @@ type Pager struct {
 }
 
 type Table struct {
-	Name       string   `json:"name"`
-	Columns    []Column `json:"columns"`
-	PrimaryKey string   `json:"primary_key"`
-	RowSize    uint32   `json:"row_size"`
-	NumRows    uint32   `json:"num_rows"`
-	Pager      *Pager   `json:"pager"`
+	Name        string   `json:"name"`
+	Columns     []Column `json:"columns"`
+	PrimaryKey  string   `json:"primary_key"`
+	RowSize     uint32   `json:"row_size"`
+	RootPageNum uint32   `json:"root_page_num"`
+	Pager       *Pager   `json:"pager"`
 }
 
 type Database struct {
 	Tables map[string]*Table
 }
 
-func NewPager(tableName string) (*Pager, uint32, error) {
-	filename := filepath.Join(DB_DIR, tableName+".db")
-	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		return nil, 0, err
-	}
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return nil, 0, err
-	}
-	fileSize := fileInfo.Size()
-	pager := &Pager{
-		File:  file,
-		Pages: [TABLE_MAX_PAGES][]byte{},
-	}
-	return pager, uint32(fileSize), nil
+// ==========================================
+// BYTE READERS / WRITERS (Big Endian)
+// ==========================================
+
+func getUint32(page []byte, offset uint32) uint32 {
+	return uint32(page[offset])<<24 |
+		uint32(page[offset+1])<<16 |
+		uint32(page[offset+2])<<8 |
+		uint32(page[offset+3])
 }
 
-func (p *Pager) FlushPage(pageNum uint32, size uint32) error {
-	if p.Pages[pageNum] == nil {
-		return fmt.Errorf("page %d is not loaded in memory", pageNum)
-	}
-	_, err := p.File.WriteAt(p.Pages[pageNum][:size], int64(pageNum*PAGE_SIZE))
-	if err != nil {
-		return err
-	}
-	return nil
+func putUint32(page []byte, offset uint32, value uint32) {
+	page[offset] = byte(value >> 24)
+	page[offset+1] = byte(value >> 16)
+	page[offset+2] = byte(value >> 8)
+	page[offset+3] = byte(value)
 }
 
-func flushTable(table *Table) error {
-	// store the table metadata (columns, primary key, etc.) in a separate file or in the first page of the table file
-	// We can store these into JSON format.
-	file, err := os.OpenFile(filepath.Join(DB_DIR, table.Name+".meta"), os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+func getNodeType(page []byte) uint8 {
+	return page[NODE_TYPE_OFFSET]
+}
 
-	// Serialize the table metadata to JSON
-	metadata := fmt.Sprintf(`{"name":"%s","columns":[`, table.Name)
-	for i, column := range table.Columns {
-		metadata += fmt.Sprintf(`{"name":"%s","type":"%s","size":%d,"offset":%d}`, column.Name, column.Type, column.Size, column.Offset)
-		if i < len(table.Columns)-1 {
-			metadata += ","
+func setNodeType(page []byte, nodeType uint8) {
+	page[NODE_TYPE_OFFSET] = nodeType
+}
+
+func isNodeRoot(page []byte) bool {
+	return page[NODE_IS_ROOT_OFFSET] == 1
+}
+
+func setNodeRoot(page []byte, isRoot bool) {
+	if isRoot {
+		page[NODE_IS_ROOT_OFFSET] = 1
+	} else {
+		page[NODE_IS_ROOT_OFFSET] = 0
+	}
+}
+
+func getNumCells(page []byte) uint32 {
+	return getUint32(page, NUM_CELLS_OFFSET)
+}
+
+func setNumCells(page []byte, numCells uint32) {
+	putUint32(page, NUM_CELLS_OFFSET, numCells)
+}
+
+func getParentPointer(page []byte) uint32 {
+	return getUint32(page, POINTER_TO_PARENT_OFFSET)
+}
+
+func setParentPointer(page []byte, parentPageNum uint32) {
+	putUint32(page, POINTER_TO_PARENT_OFFSET, parentPageNum)
+}
+
+// ==========================================
+// LEAF NODE HELPERS
+// ==========================================
+
+func leafNodeCellSize(table *Table) uint32 {
+	return LEAF_NODE_KEY_SIZE + table.RowSize
+}
+
+func leafNodeCellOffset(cellNum uint32, table *Table) uint32 {
+	return LEAF_NODE_HEADER_SIZE + (cellNum * leafNodeCellSize(table))
+}
+
+func leafNodeGetKey(page []byte, cellNum uint32, table *Table) uint32 {
+	return getUint32(page, leafNodeCellOffset(cellNum, table))
+}
+
+func leafNodeGetValue(page []byte, cellNum uint32, table *Table) []byte {
+	cellOffset := leafNodeCellOffset(cellNum, table)
+	valueOffset := cellOffset + LEAF_NODE_KEY_SIZE
+	return page[valueOffset : valueOffset+table.RowSize]
+}
+
+func leafNodeFind(table *Table, page []byte, key uint32) (uint32, bool) {
+	numCells := getNumCells(page)
+	low := uint32(0)
+	high := numCells
+
+	for low < high {
+		mid := (low + high) / 2
+		midKey := leafNodeGetKey(page, mid, table)
+		if midKey == key {
+			return mid, true
+		} else if midKey < key {
+			low = mid + 1
+		} else {
+			high = mid
 		}
 	}
-	metadata += fmt.Sprintf(`],"primary_key":"%s","row_size":%d,"num_rows":%d}`, table.PrimaryKey, table.RowSize, table.NumRows)
-
-	_, err = file.WriteString(metadata)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return low, false
 }
 
-func InitializeDatabase() *Database {
-	db := &Database{
-		Tables: make(map[string]*Table),
+func leafNodeInsert(table *Table, page []byte, key uint32, row []byte) {
+	numCells := getNumCells(page)
+	index, _ := leafNodeFind(table, page, key)
+
+	cellBytesSize := leafNodeCellSize(table)
+	if index < numCells {
+		srcOffset := leafNodeCellOffset(index, table)
+		dstOffset := leafNodeCellOffset(index+1, table)
+		bytesToMove := (numCells - index) * cellBytesSize
+		copy(page[dstOffset:dstOffset+bytesToMove], page[srcOffset:srcOffset+bytesToMove])
 	}
 
-	// load all saved tables from the database directory
-	files, err := os.ReadDir(DB_DIR)
-	if err != nil {
-		fmt.Println("Error reading database directory:", err)
-		return db
+	// Write key and row
+	cellOffset := leafNodeCellOffset(index, table)
+	putUint32(page, cellOffset, key)
+	copy(page[cellOffset+LEAF_NODE_KEY_SIZE:], row)
+
+	setNumCells(page, numCells+1)
+}
+
+// ==========================================
+// INTERNAL NODE HELPERS
+// ==========================================
+
+func internalNodeCellSize() uint32 {
+	return INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE
+}
+
+func internalNodeCellOffset(cellIndex uint32) uint32 {
+	return INTERNAL_NODE_HEADER_SIZE + (cellIndex * internalNodeCellSize())
+}
+
+func internalNodeChild(page []byte, childIndex uint32) uint32 {
+	return getUint32(page, internalNodeCellOffset(childIndex))
+}
+
+func internalNodeKey(page []byte, keyIndex uint32) uint32 {
+	return getUint32(page, internalNodeCellOffset(keyIndex)+INTERNAL_NODE_CHILD_SIZE)
+}
+
+func internalNodeSetChild(page []byte, childIndex uint32, childPageNum uint32) {
+	putUint32(page, internalNodeCellOffset(childIndex), childPageNum)
+}
+
+func internalNodeSetKey(page []byte, keyIndex uint32, key uint32) {
+	putUint32(page, internalNodeCellOffset(keyIndex)+INTERNAL_NODE_CHILD_SIZE, key)
+}
+
+func internalNodeFindChild(page []byte, key uint32) uint32 {
+	numCells := getNumCells(page)
+	low := uint32(0)
+	high := numCells
+
+	for low < high {
+		mid := (low + high) / 2
+		midKey := internalNodeKey(page, mid)
+		if midKey >= key {
+			high = mid
+		} else {
+			low = mid + 1
+		}
+	}
+	return low
+}
+
+// ==========================================
+// B-TREE TRAVERSAL & SPLITTING
+// ==========================================
+
+func findLeafNode(table *Table, pageNum uint32, key uint32) []byte {
+	page := table.Pager.Pages[pageNum]
+	if page == nil {
+		page = make([]byte, PAGE_SIZE)
+		_, err := table.Pager.File.ReadAt(page, int64(pageNum*PAGE_SIZE))
+		if err != nil && err != io.EOF {
+			fmt.Println("Error reading page from file:", err)
+		}
+		table.Pager.Pages[pageNum] = page
 	}
 
-	for _, file := range files {
-		if !file.IsDir() && strings.HasSuffix(file.Name(), ".db") {
-			tableName := strings.TrimSuffix(file.Name(), ".db")
-			pager, fileSize, err := NewPager(tableName)
-			if err != nil {
-				fmt.Println("Error loading table", tableName, ":", err)
-				continue
-			}
-			tableMetadataFileName := filepath.Join(DB_DIR, tableName+".meta")
-			tableMetadataFile, err := os.Open(tableMetadataFileName)
-			defer tableMetadataFile.Close()
-			if err != nil {
-				fmt.Println("Error opening metadata file for table", tableName, ":", err)
-				continue
-			}
+	nodeType := getNodeType(page)
+	if nodeType == NODE_LEAF {
+		return page
+	} else {
+		childIndex := internalNodeFindChild(page, key)
+		childPageNum := internalNodeChild(page, childIndex)
+		return findLeafNode(table, childPageNum, key)
+	}
+}
 
-			decoder := json.NewDecoder(tableMetadataFile)
-			var tableMetadata Table
-			err = decoder.Decode(&tableMetadata)
-			if err != nil {
-				fmt.Println("Error decoding metadata for table", tableName, ":", err)
-				continue
-			}
+func allocateNewPage(pager *Pager) uint32 {
+	for i := uint32(1); i < TABLE_MAX_PAGES; i++ {
+		if pager.Pages[i] == nil {
+			pager.Pages[i] = make([]byte, PAGE_SIZE)
+			return i
+		}
+	}
+	panic("Database overflow: Too many pages allocated!")
+}
 
-			numRows := 0
-			if tableMetadata.RowSize > 0 {
-				numRows = int(fileSize / tableMetadata.RowSize)
-			}
-			table := &Table{
-				Name:       tableName,
-				Columns:    tableMetadata.Columns,    // Columns will be loaded from metadata
-				PrimaryKey: tableMetadata.PrimaryKey, // Primary key will be loaded from metadata
-				RowSize:    tableMetadata.RowSize,    // Row size will be loaded from metadata
-				NumRows:    uint32(numRows),
-				Pager:      pager,
-			}
-			db.Tables[tableName] = table
+func createNewRootAfterLeafSplit(table *Table, leftChildPageNum uint32, rightChildPageNum uint32, dividingKey uint32) {
+	rootPageNum := allocateNewPage(table.Pager)
+	rootPage := table.Pager.Pages[rootPageNum]
+
+	setNodeType(rootPage, NODE_INTERNAL)
+	setNodeRoot(rootPage, true)
+	setNumCells(rootPage, 2)
+	setParentPointer(rootPage, 0)
+
+	internalNodeSetChild(rootPage, 0, leftChildPageNum)
+	internalNodeSetKey(rootPage, 0, dividingKey)
+	internalNodeSetChild(rootPage, 1, rightChildPageNum)
+
+	table.RootPageNum = rootPageNum
+
+	// Update children parent pointers
+	setParentPointer(table.Pager.Pages[leftChildPageNum], rootPageNum)
+	setParentPointer(table.Pager.Pages[rightChildPageNum], rootPageNum)
+
+	// Demote old root
+	setNodeRoot(table.Pager.Pages[leftChildPageNum], false)
+}
+
+func leafNodeSplitAndInsert(table *Table, oldPage []byte, key uint32, row []byte) {
+	newPageNum := allocateNewPage(table.Pager)
+	newPage := table.Pager.Pages[newPageNum]
+
+	setNodeType(newPage, NODE_LEAF)
+	setNodeRoot(newPage, false)
+	setNumCells(newPage, 0)
+
+	// Move upper half cells to new page
+	numCells := getNumCells(oldPage)
+	splitIndex := numCells / 2
+
+	for i := splitIndex; i < numCells; i++ {
+		existingKey := leafNodeGetKey(oldPage, i, table)
+		existingRow := leafNodeGetValue(oldPage, i, table)
+		leafNodeInsert(table, newPage, existingKey, existingRow)
+	}
+
+	setNumCells(oldPage, splitIndex)
+
+	firstKeyOfNewPage := leafNodeGetKey(newPage, 0, table)
+	if key < firstKeyOfNewPage {
+		leafNodeInsert(table, oldPage, key, row)
+	} else {
+		leafNodeInsert(table, newPage, key, row)
+	}
+
+	// Find page number of oldPage
+	var oldPageNum uint32
+	for pNum, p := range table.Pager.Pages {
+		if &p[0] == &oldPage[0] {
+			oldPageNum = uint32(pNum)
+			break
 		}
 	}
 
-	return db
-}
-
-func CloseDatabase(db *Database) error {
-	for _, table := range db.Tables {
-		pager := table.Pager
-		if pager != nil {
-			for pageNum, page := range pager.Pages {
-				if page != nil {
-					err := pager.FlushPage(uint32(pageNum), table.RowSize)
-					if err != nil {
-						return err
-					}
-				}
-			}
-			err := pager.File.Close()
-			if err != nil {
-				return err
-			}
-		}
-		err := flushTable(table)
-		if err != nil {
-			return err
-		}
+	if isNodeRoot(oldPage) {
+		createNewRootAfterLeafSplit(table, oldPageNum, newPageNum, firstKeyOfNewPage)
+	} else {
+		fmt.Println("Leaf split handled (Parent internal node propagation needed).")
 	}
-	return nil
 }
 
-func printTable(table Table) {
-	fmt.Println("Table name:", table.Name)
-	fmt.Println("Columns:")
-	for _, column := range table.Columns {
-		fmt.Printf("  - %s (%s)\n", column.Name, column.Type)
+func leafNodeInsertOrUpdate(table *Table, key uint32, row []byte) {
+	// Load root page if not loaded
+	if table.Pager.Pages[table.RootPageNum] == nil {
+		page := make([]byte, PAGE_SIZE)
+		n, err := table.Pager.File.ReadAt(page, int64(table.RootPageNum*PAGE_SIZE))
+
+		// If file read failed or returned 0 bytes (brand new table), initialize fresh ROOT LEAF
+		if err != nil || n == 0 {
+			setNodeType(page, NODE_LEAF)
+			setNodeRoot(page, true)
+			setNumCells(page, 0)
+		}
+		table.Pager.Pages[table.RootPageNum] = page
 	}
-	fmt.Println("Primary key:", table.PrimaryKey)
-	fmt.Println("Row size:", table.RowSize)
-	fmt.Println("Number of rows:", table.NumRows)
-}
 
-func validatePrimaryKey(columns []Column, primaryKey string) *ParseError {
-	for _, column := range columns {
-		if column.Name == primaryKey {
-			return nil
+	leaf := findLeafNode(table, table.RootPageNum, key)
+	numCells := getNumCells(leaf)
+	_, found := leafNodeFind(table, leaf, key)
+
+	if found {
+		// Update existing row
+		index, _ := leafNodeFind(table, leaf, key)
+		cellOffset := leafNodeCellOffset(index, table)
+		copy(pageCellData(leaf, cellOffset+LEAF_NODE_KEY_SIZE, table.RowSize), row)
+	} else {
+		// Max cells per leaf estimation based on page size
+		maxCells := (PAGE_SIZE - LEAF_NODE_HEADER_SIZE) / leafNodeCellSize(table)
+		if numCells >= maxCells {
+			leafNodeSplitAndInsert(table, leaf, key, row)
+		} else {
+			leafNodeInsert(table, leaf, key, row)
 		}
 	}
-	return &ParseError{Message: "Primary key '" + primaryKey + "' does not match any column names."}
 }
 
-func getTableByName(db *Database, name string) *Table {
-	// Placeholder implementation for demonstration purposes.
-	// In a real implementation, this would look up the table in the database.
-	if table, exists := db.Tables[name]; exists {
-		return table
-	}
-	return nil
+func pageCellData(page []byte, offset uint32, size uint32) []byte {
+	return page[offset : offset+size]
 }
 
-func calculateColumnLayout(columns []Column) (uint32, []Column) {
-	var offset uint32 = 0
-	for i := range columns {
-		switch columns[i].Type {
-		case "int":
-			columns[i].Size = 4
-		case "string":
-			columns[i].Size = 255 // Assuming a fixed size for strings for simplicity
-		default:
-			columns[i].Size = 0 // Unknown type
-		}
-		columns[i].Offset = offset
-		offset += columns[i].Size
-	}
-	return offset, columns
-}
-
-func parseCreateStatement(db *Database, input string) *ParseError {
-	pattern := regexp.MustCompile(`\(([a-zA-Z0-9_]+),\s*([a-zA-Z0-9_]+)\)`)
-	input = strings.TrimPrefix(input, "create")
-	tableName, columnStrings, found := strings.Cut(input, "with")
-	if !found {
-		return &ParseError{Message: "Syntax error: missing 'with' keyword in create statement."}
-	}
-	columnStrings, primaryKey, found := strings.Cut(columnStrings, "primaryKey")
-	if !found {
-		return &ParseError{Message: "Syntax error: missing 'primaryKey' keyword in create statement."}
-	}
-	tableName = strings.TrimSpace(tableName)
-	primaryKey = strings.TrimSpace(primaryKey)
-	columnsString := pattern.FindAllStringSubmatch(columnStrings, -1)
-	var columns []Column
-	for _, match := range columnsString {
-		column := Column{
-			Name: strings.TrimSpace(match[1]),
-			Type: strings.TrimSpace(match[2]),
-		}
-		columns = append(columns, column)
-	}
-	errs := validatePrimaryKey(columns, primaryKey)
-	if errs != nil {
-		return errs
-	}
-	offset, updatedColumns := calculateColumnLayout(columns)
-	pager, fileSize, err := NewPager(tableName)
-	numRows := fileSize / offset
-	if err != nil {
-		return &ParseError{Message: "Failed to create pager for table '" + tableName + "': " + err.Error()}
-	}
-	table := Table{
-		Name:       tableName,
-		Columns:    updatedColumns,
-		PrimaryKey: primaryKey,
-		RowSize:    offset,
-		Pager:      pager,
-		NumRows:    uint32(numRows),
-	}
-	printTable(table)
-	if db.Tables[tableName] != nil {
-		return &ParseError{Message: "Table '" + tableName + "' already exists."}
-	}
-	db.Tables[tableName] = &table
-	return nil
-}
+// ==========================================
+// SERIALIZATION & PAGER MANAGEMENT
+// ==========================================
 
 func SerializeRow(table *Table, columns []string) ([]byte, error) {
 	if len(columns) != len(table.Columns) {
@@ -294,188 +393,275 @@ func SerializeRow(table *Table, columns []string) ([]byte, error) {
 		case "int":
 			value, err := strconv.Atoi(column)
 			if err != nil {
-				return nil, fmt.Errorf("invalid int value for column '%s': %v", table.Columns[i].Name, err)
+				return nil, fmt.Errorf("invalid int value: %v", err)
 			}
 			offset := table.Columns[i].Offset
-			row[offset] = byte(value >> 24)
-			row[offset+1] = byte(value >> 16)
-			row[offset+2] = byte(value >> 8)
-			row[offset+3] = byte(value)
+			putUint32(row, offset, uint32(value))
 		case "string":
 			if len(column) > int(table.Columns[i].Size) {
-				return nil, fmt.Errorf("string value for column '%s' exceeds maximum size", table.Columns[i].Name)
+				return nil, fmt.Errorf("string exceeds maximum size")
 			}
 			offset := table.Columns[i].Offset
 			copy(row[offset:], []byte(column))
-		default:
-			return nil, fmt.Errorf("unknown type for column '%s'", table.Columns[i].Name)
 		}
 	}
 	return row, nil
 }
 
 func DeserializeRow(table *Table, row []byte) ([]string, error) {
-	if len(row) != int(table.RowSize) {
-		return nil, fmt.Errorf("row size does not match table definition")
-	}
-
 	columns := make([]string, len(table.Columns))
 	for i, column := range table.Columns {
 		offset := column.Offset
 		switch column.Type {
 		case "int":
-			value := int(row[offset])<<24 | int(row[offset+1])<<16 | int(row[offset+2])<<8 | int(row[offset+3])
-			columns[i] = strconv.Itoa(value)
+			value := getUint32(row, offset)
+			columns[i] = strconv.Itoa(int(value))
 		case "string":
 			strValue := string(row[offset : offset+column.Size])
-			columns[i] = strValue
-		default:
-			return nil, fmt.Errorf("unknown type for column '%s'", column.Name)
+			columns[i] = strings.TrimRight(strValue, "\x00")
 		}
 	}
 	return columns, nil
 }
 
-func rowSlot(table *Table, rowNum uint32) ([]byte, uint32) {
-	rowsPerPage := PAGE_SIZE / table.RowSize
-	pageNum := rowNum / rowsPerPage
-	rowOffset := rowNum % rowsPerPage
-	byteOffset := rowOffset * table.RowSize
+func NewPager(tableName string) (*Pager, uint32, error) {
+	filename := filepath.Join(DB_DIR, tableName+".db")
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return nil, 0, err
+	}
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	return &Pager{File: file}, uint32(fileInfo.Size()), nil
+}
 
-	// Allocate page memory only when accessed (lazy allocation)
-	// Cache miss
-	if table.Pager.Pages[pageNum] == nil {
-		table.Pager.Pages[pageNum] = make([]byte, PAGE_SIZE)
+func (p *Pager) FlushPage(pageNum uint32, size uint32) error {
+	if p.Pages[pageNum] == nil {
+		return nil
+	}
+	_, err := p.File.WriteAt(p.Pages[pageNum], int64(pageNum*PAGE_SIZE))
+	return err
+}
 
-		_, err := table.Pager.File.ReadAt(table.Pager.Pages[pageNum], int64(pageNum*PAGE_SIZE))
-		// read from disk into memory, if the page is not already in memory
-		if err != nil && err != io.EOF {
-			fmt.Println("Error reading page from file:", err)
-		}
+func flushTable(table *Table) error {
+	file, err := os.OpenFile(filepath.Join(DB_DIR, table.Name+".meta"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	return encoder.Encode(table)
+}
+
+func InitializeDatabase() *Database {
+	db := &Database{Tables: make(map[string]*Table)}
+	os.MkdirAll(DB_DIR, 0755)
+
+	files, err := os.ReadDir(DB_DIR)
+	if err != nil {
+		return db
 	}
 
-	return table.Pager.Pages[pageNum], byteOffset
+	for _, file := range files {
+		if !file.IsDir() && strings.HasSuffix(file.Name(), ".meta") {
+			tableName := strings.TrimSuffix(file.Name(), ".meta")
+			metaFile, err := os.Open(filepath.Join(DB_DIR, tableName+".meta"))
+			if err != nil {
+				continue
+			}
+			var table Table
+			if json.NewDecoder(metaFile).Decode(&table) == nil {
+				pager, _, err := NewPager(tableName)
+				if err == nil {
+					table.Pager = pager
+					db.Tables[tableName] = &table
+				}
+			}
+			metaFile.Close()
+		}
+	}
+	return db
+}
+
+func CloseDatabase(db *Database) error {
+	for _, table := range db.Tables {
+		if table.Pager != nil {
+			for pageNum, page := range table.Pager.Pages {
+				if page != nil {
+					_ = table.Pager.FlushPage(uint32(pageNum), PAGE_SIZE)
+				}
+			}
+			_ = table.Pager.File.Close()
+		}
+		_ = flushTable(table)
+	}
+	return nil
+}
+
+// ==========================================
+// STATEMENTS PARSERS & EXECUTORS
+// ==========================================
+
+func parseCreateStatement(db *Database, input string) *ParseError {
+	input = strings.TrimPrefix(input, "create")
+	tableName, columnStrings, found := strings.Cut(input, "with")
+	if !found {
+		return &ParseError{Message: "Missing 'with' keyword."}
+	}
+	columnStrings, primaryKey, found := strings.Cut(columnStrings, "primaryKey")
+	if !found {
+		return &ParseError{Message: "Missing 'primaryKey' keyword."}
+	}
+	tableName = strings.TrimSpace(tableName)
+	primaryKey = strings.TrimSpace(primaryKey)
+
+	pattern := regexp.MustCompile(`\(([a-zA-Z0-9_]+),\s*([a-zA-Z0-9_]+)\)`)
+	matches := pattern.FindAllStringSubmatch(columnStrings, -1)
+	var columns []Column
+	var offset uint32 = 0
+	for _, m := range matches {
+		colType := strings.TrimSpace(m[2])
+		var size uint32 = 4
+		if colType == "string" {
+			size = 255
+		}
+		columns = append(columns, Column{Name: strings.TrimSpace(m[1]), Type: colType, Size: size, Offset: offset})
+		offset += size
+	}
+
+	pager, _, err := NewPager(tableName)
+	if err != nil {
+		return &ParseError{Message: err.Error()}
+	}
+
+	table := &Table{
+		Name:        tableName,
+		Columns:     columns,
+		PrimaryKey:  primaryKey,
+		RowSize:     offset,
+		RootPageNum: 0,
+		Pager:       pager,
+	}
+
+	db.Tables[tableName] = table
+	fmt.Printf("Table '%s' created successfully.\n", tableName)
+	return nil
 }
 
 func parseInsertStatement(db *Database, input string) *ParseError {
 	input = strings.TrimPrefix(input, "insert")
 	columnsString, tableName, found := strings.Cut(input, "into")
 	if !found {
-		return &ParseError{Message: "Syntax error: missing 'into' keyword in insert statement."}
+		return &ParseError{Message: "Missing 'into' keyword."}
 	}
 	tableName = strings.TrimSpace(tableName)
-	table := getTableByName(db, tableName)
+	table := db.Tables[tableName]
 	if table == nil {
-		return &ParseError{Message: "Table '" + tableName + "' does not exist."}
+		return &ParseError{Message: "Table does not exist."}
 	}
-	columnsString = strings.TrimSpace(columnsString)
-	columns := strings.Split(columnsString, ",")
+
+	columns := strings.Split(strings.TrimSpace(columnsString), ",")
 	if len(columns) != len(table.Columns) {
-		return &ParseError{Message: "Syntax error: incorrect number of columns specified in insert statement."}
-	}
-	for i, column := range columns {
-		columns[i] = strings.TrimSpace(column)
-		switch table.Columns[i].Type {
-		case "int":
-			if _, err := strconv.Atoi(column); err != nil {
-				return &ParseError{Message: "Type error: expected int for column '" + table.Columns[i].Name + "'."}
-			}
-		case "string":
-			if !strings.HasPrefix(column, "\"") || !strings.HasSuffix(column, "\"") {
-				return &ParseError{Message: "Type error: expected string for column '" + table.Columns[i].Name + "'."}
-			}
-		default:
-			return &ParseError{Message: "Unknown type for column '" + table.Columns[i].Name + "'."}
-		}
-	}
-	fmt.Println("Parsed insert statement:")
-	fmt.Println("Table name:", tableName)
-	fmt.Println("Columns:", columns)
-
-	rowsPerPage := PAGE_SIZE / table.RowSize
-	if table.NumRows >= uint32(rowsPerPage*TABLE_MAX_PAGES) {
-		return &ParseError{Message: "Table '" + tableName + "' is full."}
+		return &ParseError{Message: "Incorrect number of columns."}
 	}
 
-	page, byteOffset := rowSlot(table, table.NumRows)
+	for i := range columns {
+		columns[i] = strings.TrimSpace(columns[i])
+	}
+
 	row, err := SerializeRow(table, columns)
 	if err != nil {
 		return &ParseError{Message: err.Error()}
 	}
-	copy(page[byteOffset:], row)
-	table.NumRows++
-	printTable(*table)
-	return nil
 
+	// Extract primary key value (assumed to be the first int column or matching PrimaryKey)
+	var primaryKeyValue uint32
+	for i, col := range table.Columns {
+		if col.Name == table.PrimaryKey {
+			val, _ := strconv.Atoi(columns[i])
+			primaryKeyValue = uint32(val)
+			break
+		}
+	}
+
+	leafNodeInsertOrUpdate(table, primaryKeyValue, row)
+	fmt.Println("Row inserted successfully via B-Tree.")
+	return nil
 }
 
 func parseSelectStatement(db *Database, input string) *ParseError {
 	input = strings.TrimPrefix(input, "select")
 	tableName := strings.TrimSpace(input)
-	table := getTableByName(db, tableName)
+	table := db.Tables[tableName]
 	if table == nil {
-		return &ParseError{Message: "Table '" + tableName + "' does not exist."}
+		return &ParseError{Message: "Table does not exist."}
 	}
 
-	fmt.Println("Parsed select statement:")
-	fmt.Println("Table name:", tableName)
-
-	for rowNum := uint32(0); rowNum < table.NumRows; rowNum++ {
-		page, byteOffset := rowSlot(table, rowNum)
-		rowData := page[byteOffset : byteOffset+table.RowSize]
-		columns, err := DeserializeRow(table, rowData)
+	// Traverse to root or first loaded leaf to scan records
+	if table.Pager.Pages[table.RootPageNum] == nil {
+		page := make([]byte, PAGE_SIZE)
+		_, err := table.Pager.File.ReadAt(page, int64(table.RootPageNum*PAGE_SIZE))
 		if err != nil {
-			return &ParseError{Message: err.Error()}
+			fmt.Println("Table is empty.")
+			return nil
 		}
-		fmt.Println("Row", rowNum+1, ":", columns)
+		table.Pager.Pages[table.RootPageNum] = page
+	}
+
+	leaf := findLeafNode(table, table.RootPageNum, 0)
+	numCells := getNumCells(leaf)
+
+	for i := uint32(0); i < numCells; i++ {
+		rowData := leafNodeGetValue(leaf, i, table)
+		cols, err := DeserializeRow(table, rowData)
+		if err != nil {
+			continue
+		}
+		fmt.Println("Row", i+1, ":", cols)
 	}
 
 	return nil
 }
 
 func metaCommand(db *Database, input string) {
-	switch input {
-	case ".exit":
-		err := CloseDatabase(db)
-		if err != nil {
-			fmt.Println("Error closing database:", err)
-		}
+	if input == ".exit" {
+		_ = CloseDatabase(db)
 		os.Exit(0)
-	default:
-		fmt.Println("Unrecognized command '" + input + "'.")
+	} else {
+		fmt.Println("Unrecognized command.")
 	}
 }
 
 func executeStatement(db *Database, input string) {
 	if strings.HasPrefix(input, "create") {
-		err := parseCreateStatement(db, input)
-		if err != nil {
-			fmt.Println(err.Error())
+		if err := parseCreateStatement(db, input); err != nil {
+			fmt.Println("Error:", err.Error())
 		}
 	} else if strings.HasPrefix(input, "insert") {
-		err := parseInsertStatement(db, input)
-		if err != nil {
-			fmt.Println(err.Error())
+		if err := parseInsertStatement(db, input); err != nil {
+			fmt.Println("Error:", err.Error())
 		}
 	} else if strings.HasPrefix(input, "select") {
-		err := parseSelectStatement(db, input)
-		if err != nil {
-			fmt.Println(err.Error())
+		if err := parseSelectStatement(db, input); err != nil {
+			fmt.Println("Error:", err.Error())
 		}
 	} else {
-		fmt.Println("Unrecognized keyword at start of '" + input + "'.")
+		fmt.Println("Unrecognized keyword.")
 	}
 }
 
 func main() {
 	db := InitializeDatabase()
-	fmt.Print("> ")
 	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Print("> ")
 	for scanner.Scan() {
-		input := scanner.Text()
+		input := strings.TrimSpace(scanner.Text())
 		if strings.HasPrefix(input, ".") {
 			metaCommand(db, input)
-		} else {
+		} else if len(input) > 0 {
 			executeStatement(db, input)
 		}
 		fmt.Print("> ")
